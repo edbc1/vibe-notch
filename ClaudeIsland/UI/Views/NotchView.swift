@@ -190,6 +190,7 @@ struct NotchView: View {
         .preferredColorScheme(.dark)
         .onAppear {
             sessionMonitor.startMonitoring()
+            viewModel.multiplexCount = sessionMonitor.instances.count
             // On non-notched devices, keep visible so users have a target to interact with
             if !viewModel.hasPhysicalNotch {
                 isVisible = true
@@ -202,6 +203,9 @@ struct NotchView: View {
             handlePendingSessionsChange(sessions)
         }
         .onChange(of: sessionMonitor.instances) { _, instances in
+            if viewModel.multiplexCount != instances.count {
+                viewModel.multiplexCount = instances.count
+            }
             handleProcessingChange()
             handleWaitingForInputChange(instances)
         }
@@ -352,7 +356,7 @@ struct NotchView: View {
         Group {
             switch viewModel.contentType {
             case .instances:
-                ClaudeInstancesView(
+                MultiplexView(
                     sessionMonitor: sessionMonitor,
                     viewModel: viewModel
                 )
