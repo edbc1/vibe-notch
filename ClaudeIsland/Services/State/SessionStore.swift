@@ -1126,6 +1126,7 @@ actor SessionStore {
         let cwd: String
         let status: String?
         let startedAt: Double?
+        let statusUpdatedAt: Double?
     }
 
     /// Hooks only announce a session once it does something, so sessions that were
@@ -1139,14 +1140,23 @@ actor SessionStore {
         ) else { return }
 
         var tree: [Int: ProcessInfo]?
-        var addedSession = false
+        var changed = false
 
         for file in files where file.pathExtension == "json" {
             guard let data = try? Data(contentsOf: file),
                   let entry = try? JSONDecoder().decode(SessionRegistryEntry.self, from: data),
-                  sessions[entry.sessionId] == nil,
-                  !dismissedSessionIds.contains(entry.sessionId),
-                  isProcessRunning(pid: entry.pid) else { continue }
+                  !dismissedSessionIds.contains(entry.sessionId) else { continue }
+
+            if var existing = sessions[entry.sessionId] {
+                if reconcilePhase(of: &existing, with: entry) {
+                    sessions[entry.sessionId] = existing
+                    scheduleFileSync(sessionId: existing.sessionId, cwd: existing.cwd)
+                    changed = true
+                }
+                continue
+            }
+
+            guard isProcessRunning(pid: entry.pid) else { continue }
 
             let processTree = tree ?? ProcessTreeBuilder.shared.buildTree()
             tree = processTree
@@ -1162,13 +1172,38 @@ actor SessionStore {
                 lastActivity: startedAt,
                 createdAt: startedAt
             )
-            addedSession = true
+            changed = true
             Self.logger.info("Discovered running session \(entry.sessionId.prefix(8), privacy: .public) (pid \(entry.pid))")
         }
 
-        if addedSession {
+        if changed {
             publishState()
         }
+    }
+
+    /// Correct a phase that hooks left stale (e.g. a missed Stop leaves a session
+    /// "processing" forever). Only trusts the registry when its status changed after
+    /// the last hook we saw, so a fresh hook always wins.
+    private func reconcilePhase(of session: inout SessionState, with entry: SessionRegistryEntry) -> Bool {
+        guard let updatedAtMs = entry.statusUpdatedAt,
+              Date(timeIntervalSince1970: updatedAtMs / 1000) > session.lastActivity else { return false }
+
+        let target: SessionPhase
+        switch (entry.status, session.phase) {
+        case ("idle", .processing), ("idle", .compacting):
+            target = .waitingForInput
+        case ("busy", .idle), ("busy", .waitingForInput):
+            target = .processing
+        default:
+            return false
+        }
+
+        guard session.phase.canTransition(to: target) else { return false }
+        let shortId = String(session.sessionId.prefix(8))
+        let from = String(describing: session.phase)
+        Self.logger.info("Registry reconciled \(shortId, privacy: .public): \(from, privacy: .public) -> \(String(describing: target), privacy: .public)")
+        session.phase = target
+        return true
     }
 
     /// Check if a process is still running

@@ -97,10 +97,9 @@ struct MultiplexView: View {
     private var grid: some View {
         ScrollView(.vertical, showsIndicators: false) {
             LazyVGrid(columns: gridColumns, spacing: MultiplexLayout.spacing) {
-                ForEach(Array(orderedInstances.enumerated()), id: \.element.stableId) { index, session in
+                ForEach(orderedInstances, id: \.stableId) { session in
                     SessionTVTile(
                         session: session,
-                        channel: index + 1,
                         onOpen: { viewModel.showChat(for: session) },
                         onApprove: { sessionMonitor.approvePermission(sessionId: session.sessionId) },
                         onDeny: { sessionMonitor.denyPermission(sessionId: session.sessionId, reason: nil) },
@@ -120,7 +119,6 @@ struct MultiplexView: View {
 
 struct SessionTVTile: View {
     let session: SessionState
-    let channel: Int
     let onOpen: () -> Void
     let onApprove: () -> Void
     let onDeny: () -> Void
@@ -136,19 +134,13 @@ struct SessionTVTile: View {
         historyManager.history(for: session.sessionId)
     }
 
-    /// Input is required: a permission prompt, or Claude finished and is waiting for the next message
+    /// Input is required: a permission prompt or a question from Claude
     private var needsApproval: Bool { session.phase.isWaitingForApproval }
     private var isReady: Bool { session.phase == .waitingForInput }
-    private var needsUser: Bool { needsApproval || isReady }
+    /// Only "needs input" lights the frame; done sessions stay calm
+    private var needsUser: Bool { statusKind == .needsInput }
 
-    private var accentColor: Color {
-        switch session.phase {
-        case .waitingForApproval: return TerminalColors.amber
-        case .waitingForInput: return TerminalColors.green
-        case .processing, .compacting: return claudeOrange
-        case .idle, .ended: return .white
-        }
-    }
+    private var accentColor: Color { statusKind.color }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -193,10 +185,8 @@ struct SessionTVTile: View {
             withAnimation(.easeOut(duration: 0.2)) { pulse = false }
             return
         }
-        // Approvals pulse faster than "ready" — they're blocking work
-        let duration = needsApproval ? 0.7 : 1.4
         pulse = false
-        withAnimation(.easeInOut(duration: duration).repeatForever(autoreverses: true)) {
+        withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
             pulse = true
         }
     }
@@ -226,7 +216,7 @@ struct SessionTVTile: View {
                 )
                 .allowsHitTesting(false)
 
-            if needsApproval {
+            if needsUser {
                 approvalOverlay
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
@@ -257,14 +247,14 @@ struct SessionTVTile: View {
         VStack {
             Spacer()
             HStack(spacing: 6) {
-                Text(MCPToolFormatter.formatToolName(session.pendingToolName ?? "Tool"))
+                Text(approvalOverlayText)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(TerminalColors.amber)
+                    .foregroundColor(statusKind.color)
                     .lineLimit(1)
 
                 Spacer(minLength: 4)
 
-                if session.pendingToolName != "AskUserQuestion" {
+                if needsApproval && session.pendingToolName != "AskUserQuestion" {
                     Button(action: onDeny) {
                         Text("Deny")
                             .font(.system(size: 10, weight: .medium))
@@ -300,11 +290,6 @@ struct SessionTVTile: View {
 
     private var bezelLabel: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(session.phase == .idle || session.phase == .ended ? Color.white.opacity(0.2) : accentColor)
-                .frame(width: 5, height: 5)
-                .shadow(color: accentColor.opacity(needsUser || session.phase.isActive ? 0.8 : 0), radius: 3)
-
             Text(session.projectName)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
@@ -322,25 +307,44 @@ struct SessionTVTile: View {
                 .help("Turn off (archive session)")
                 .transition(.opacity)
             } else {
-                Text(statusLabel)
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundColor(needsUser ? accentColor : .white.opacity(0.3))
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    SessionStatusGlyph(kind: statusKind, size: 10)
+                    Text(statusLabel)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(statusKind.color)
+                        .lineLimit(1)
+                }
+                .help(statusKind.helpText)
             }
         }
         .padding(.horizontal, 10)
         .frame(height: 24)
     }
 
+    private var statusKind: SessionStatusKind { SessionStatusKind(session: session) }
+
     private var statusLabel: String {
+        if statusKind == .needsInput { return "NEEDS YOU" }
         switch session.phase {
         case .waitingForApproval: return "NEEDS YOU"
-        case .waitingForInput: return "YOUR TURN"
-        case .processing: return "LIVE"
-        case .compacting: return "COMPACTING"
-        case .idle: return String(format: "CH %02d", channel)
-        case .ended: return "OFF"
+        case .processing, .compacting: return "IN PROGRESS"
+        case .waitingForInput, .idle, .ended: return "DONE"
         }
+    }
+
+    /// For a question, show Claude's recommended answer; otherwise the tool name
+    private var approvalOverlayText: String {
+        if let prompt = session.turnPrompt {
+            return "? " + prompt.question
+        }
+        if session.pendingToolName == "AskUserQuestion" {
+            let questions = PendingQuestion.parse(session.activePermission?.toolInput)
+            if let recommended = questions.first?.recommended {
+                return "Suggests: \(recommended.displayLabel)"
+            }
+            return "Question — click to answer"
+        }
+        return MCPToolFormatter.formatToolName(session.pendingToolName ?? "Tool")
     }
 
     // MARK: - Feed Lines
